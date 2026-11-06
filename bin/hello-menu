@@ -1,0 +1,36 @@
+#!/usr/bin/env -S python3 -I
+"""hello-menu - Omarchy menu integration for Hello Lock.
+
+On the standalone (Omarchy-free) port there is no Omarchy menu file to edit,
+so this is a polite no-op that keeps the settings screen working:
+
+  hello-menu status   prints nothing (exit 0) - the settings hide their menu options
+  hello-menu secure   prints done (exit 0)    - nothing to make private
+  hello-menu add / remove
+                      prints a note on stderr (exit 1)
+
+Instead of a menu entry, open the settings with `helloctl settings` (bind it
+to any Hyprland key, see the install instructions in README.md).
+"""
+
+import sys
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "status"
+    if cmd == "status":
+        return 0
+    if cmd == "secure":
+        print("done")
+        return 0
+    if cmd in ("add", "remove"):
+        sys.stderr.write(
+            "hello-menu: Omarchy's menu doesn't exist on this install. "
+            "Open the settings with `helloctl settings` and bind it to a key.\n")
+        return 1
+    sys.stderr.write("hello-menu: unknown command %r (status, add, remove, secure)\n" % cmd)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

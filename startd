@@ -1,0 +1,5 @@
+#!/bin/bash
+z=$0
+dn="$(dirname $z)"
+echo $dn
+cd $dn && qs -p .

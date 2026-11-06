@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# hello-blank - idle blank while the lock screen waits for input.
+# Standalone replacement for Omarchy's omarchy-brightness-*-off helpers.
+# Input wakes the output again, and the lock view calls hello-wake when the
+# password check or unlock needs the screen visible.
+exec >/dev/null 2>&1
+if command -v hyprctl >/dev/null 2>&1; then
+  hyprctl dispatch dpms off >/dev/null 2>&1
+fi
+exit 0

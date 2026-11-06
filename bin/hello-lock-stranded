@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# hello-lock-stranded - detects a session lock the compositor still holds with
+# no locker alive to own it (a quickshell crash while locked, say).
+# Standalone port of Omarchy's omarchy-hyprland-session-lock-stranded, which
+# this project copies semantics (and Service.qml's recovery) from.
+#
+# Usage: hello-lock-stranded <own-pid>
+#   exit 0  a lock is stranded: no other quickshell/qs/hyprlock is running to
+#           own it -> the caller may re-lock and let the user unlock
+#   exit 1  no lock is held
+#   exit 2  undetermined: a lock is held but another locker is alive (it may be
+#           that other shell's live lock — taking it would strand it on exit),
+#           or Hyprland hasn't settled, or the tools are missing. The caller
+#           keeps asking until it gives up.
+
+hyprctl -j monitors >/dev/null 2>&1 || exit 2
+command -v jq >/dev/null 2>&1 || exit 2
+
+monitors=$(hyprctl -j monitors 2>/dev/null) || exit 2
+
+# Hyprland reports no lock state directly, but an active ext-session-lock is one
+# of the reasons a monitor cannot go solitary: LOCK in solitaryBlockedBy. It
+# stays set once the lock's client dies, which is the case worth detecting.
+locked=$(jq 'any(.[]; (.solitaryBlockedBy // []) | index("LOCK"))? // false' \
+  <<<"$monitors" 2>/dev/null) || locked=false
+
+case $locked in
+  true)
+    # Another quickshell/qs/hyprlock running? Then the lock is theirs while
+    # they live. Our own pid is skipped: a crash re-execs this shell in place,
+    # so it's the pid allowed to recover.
+    if pgrep -u "$UID" -x 'quickshell|qs|hyprlock' 2>/dev/null | grep -qvxF "$1"; then
+      exit 2
+    fi
+    exit 0
+    ;;
+  false) exit 1 ;;
+  *) exit 2 ;;
+esac

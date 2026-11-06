@@ -1,0 +1,7 @@
+#%PAM-1.0
+# Hello Lock fingerprint check (optional, standalone port of Omarchy's
+# omarchy-lock-fingerprint). Installed on machines with a fingerprint reader:
+# first a fingerprint, then the password service as fallback.
+auth        sufficient  pam_fprintd.so
+auth        required    pam_unix.so
+account     required    pam_unix.so

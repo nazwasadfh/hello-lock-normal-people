@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# helloctl - control the standalone Hello Lock shell from anywhere.
+#
+#   helloctl lock                lock the session now
+#   helloctl isLocked            print true/false
+#   helloctl status              detailed JSON status of the lock service
+#   helloctl settings            open the settings window
+#   helloctl onboarding          open the first-run setup window
+#   helloctl preview             show the lock screen preview (click/Esc closes)
+#   helloctl splashPreview       play a random unlock animation
+#   helloctl ...                 anything else is passed to the lock IPC target
+#                                (see the IpcHandler in Service.qml)
+#   helloctl start               start the shell (qs -p) detached in the session
+#   helloctl stop                stop the shell
+#   helloctl wake                wake the display (hypridle after-sleep hook)
+#
+# The shell must be running: `qs -p /path/to/this/folder` from Hyprland
+# exec-once, or `helloctl start`.
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"
+ROOT="$(dirname "$(dirname "$SELF")")"
+
+cmd="${1:-}"; shift 2>/dev/null || true
+
+case "$cmd" in
+  start)
+    exec qs -p "$ROOT" "$@"
+    ;;
+  stop)
+    exec qs kill -p "$ROOT" "$@" 2>/dev/null || true
+    ;;
+  wake)
+    exec "$ROOT/bin/hello-wake"
+    ;;
+  ""|-h|--help|help)
+    sed -n '2,20p' "$SELF" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+esac
+
+# Everything else is an IPC call into the running instance.
+exec qs ipc -p "$ROOT" call lock "$cmd" "$@"

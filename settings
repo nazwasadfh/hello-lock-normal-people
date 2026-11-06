@@ -1,0 +1,5 @@
+#!/bin/bash
+z=$0
+dn="$(dirname $z)"
+echo $dn
+qs ipc -p ~/.config/quickshell/hello-lock/ call lock settings || notify-send "Error when locking" && exit 1

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# hello-wake - bring the display back up (used after locking and on resume).
+# Standalone replacement for Omarchy's omarchy-system-wake.
+exec >/dev/null 2>&1
+if command -v hyprctl >/dev/null 2>&1 && hyprctl dispatch dpms on >/dev/null 2>&1; then
+  exit 0
+fi
+exit 0

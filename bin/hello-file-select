@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# hello-file-select - graphical file chooser; standalone replacement for
+# omarchy-file-select. Prints the chosen path on stdout and exits 0, or exits 1
+# when nothing is chosen. Accepted by Onboarding.qml and Settings.qml verbatim.
+#
+# Usage: hello-file-select [--title TITLE] [--extensions "svg png jpg jpeg webp"]
+set -euo pipefail
+
+TITLE="Choose a file"
+EXTENSIONS=""
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --title) TITLE="$2"; shift 2 ;;
+    --extensions) EXTENSIONS="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+run_zenity() {
+  local args=(--file-selection --title "$TITLE" --filename "$HOME/")
+  if [[ -n $EXTENSIONS ]]; then
+    local patterns=()
+    local ext
+    for ext in $EXTENSIONS; do patterns+=("*.$ext"); done
+    args+=(--file-filter "$TITLE | ${patterns[*]}")
+    args+=(--file-filter "All files | *.*")
+  fi
+  zenity "${args[@]}" 2>/dev/null
+}
+
+run_kdialog() {
+  local args=(--title "$TITLE" --getopenfilename "$HOME/")
+  if [[ -n $EXTENSIONS ]]; then
+    local mimetypes=()
+    local ext
+    for ext in $EXTENSIONS; do mimetypes+=("image/$ext"); done
+    args+=("${mimetypes[*]}")
+  fi
+  kdialog "${args[@]}" 2>/dev/null
+}
+
+if command -v zenity >/dev/null 2>&1; then
+  chosen=$(run_zenity) || chosen=""
+elif command -v kdialog >/dev/null 2>&1; then
+  chosen=$(run_kdialog) || chosen=""
+else
+  echo "hello-file-select: install zenity (extra/zenity) or kdialog, and no chooser will open" >&2
+  exit 1
+fi
+
+chosen="${chosen%$'\n'}"
+chosen="${chosen%"${chosen##*[![:space:]]}"}"
+[[ -n $chosen ]] || exit 1
+printf '%s\n' "$chosen"

@@ -1,0 +1,316 @@
+#!/usr/bin/env -S python3 -I
+"""Hello Lock settings helper (used by the setup and settings screens).
+
+  hello-config save JSON        merge JSON into ~/.config/hello-lock/config.json
+  hello-config save --no-backup JSON
+                                the same, without a new timestamped backup (the
+                                settings screen backs up once per visit)
+  hello-config sound-get        print sound.conf as JSON (volume, quiet hours)
+  hello-config sound-save JSON  update sound.conf: {"volume": 0.5,
+                                "quietStart": 23, "quietEnd": 7}; null turns
+                                quiet hours off
+  hello-config import-logo PATH copy an image into ~/.config/hello-lock/ and print
+                                the new path (so moving the original later is safe)
+  hello-config preset ACTION VALUE
+                                create/update NAME, apply/delete ID, next "",
+                                or mode manual|cycle|shuffle; prints saved config
+  hello-config done             mark onboarding as finished
+  hello-config pending          exit 0 if onboarding has never been finished
+  hello-config doctor [ARGS]    check the install and config (runs hello-lock-doctor)
+
+Writes are atomic; unknown keys already in config.json are kept. Only the
+newest 10 config backups are kept.
+"""
+import json
+import hashlib
+import os
+import shutil
+import sys
+import tempfile
+import subprocess
+import datetime
+
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "hello-lock")
+CONFIG = os.path.join(CONFIG_DIR, "config.json")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "hello-lock")
+DONE = os.path.join(STATE_DIR, "onboarded")
+SOUND_CONF = os.path.join(CONFIG_DIR, "sound.conf")
+SOUND_DEFAULTS = {"volume": 0.5, "quietStart": 23, "quietEnd": 7}
+KEEP_BACKUPS = 10
+IMAGE_TYPES = {".svg", ".png", ".jpg", ".jpeg", ".webp"}
+ALLOWED = {"name", "brand", "logo", "symbol", "symbolParts", "tintLogo", "birthday", "wordmarkStyle",
+           "sounds", "weather", "powerDown", "legendary", "clock", "wordmarkText", "motion", "wallpaper",
+           "typingEffect", "handoff", "brandingPresets", "presetMode", "selectedPreset"}
+
+
+def atomic_write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def prune_backups():
+    prefix = os.path.basename(CONFIG) + ".bak."
+    try:
+        names = sorted(n for n in os.listdir(CONFIG_DIR) if n.startswith(prefix))
+    except OSError:
+        return
+    for name in names[:-KEEP_BACKUPS]:
+        try:
+            os.unlink(os.path.join(CONFIG_DIR, name))
+        except OSError:
+            pass
+
+
+def save(raw, backup=True):
+    update = json.loads(raw)
+    if not isinstance(update, dict):
+        sys.exit("hello-config: expected a JSON object")
+    if "brandingPresets" in update and update["brandingPresets"] is not None:
+        validate_presets(update["brandingPresets"])
+    try:
+        with open(CONFIG, encoding="utf-8") as f:
+            current = json.load(f)
+        if not isinstance(current, dict):
+            sys.exit("hello-config: existing config must be a JSON object; refusing to replace it")
+    except FileNotFoundError:
+        current = {}
+    except (OSError, ValueError) as exc:
+        sys.exit("hello-config: cannot read existing config; refusing to replace it: " + str(exc))
+    # Store new assets under new names. A canceled setup or failed config write
+    # must never replace an image still referenced by the saved configuration.
+    if update.get("wordmarkText"):
+        renderer = os.path.join(os.path.dirname(os.path.realpath(__file__)), "hello-wordmark")
+        rendered = subprocess.run([renderer, update["wordmarkText"], "-", "--style",
+                                   update.get("wordmarkStyle", current.get("wordmarkStyle")) or "blocks"],
+                                  check=True, capture_output=True, text=True)
+        digest = hashlib.sha256(rendered.stdout.encode()).hexdigest()
+        logo = "wordmark-" + digest + ".svg"
+        atomic_write(os.path.join(CONFIG_DIR, logo), rendered.stdout)
+        update["logo"] = logo
+    for key, value in update.items():
+        if key not in ALLOWED:
+            continue
+        if value is None:
+            current.pop(key, None)
+        else:
+            current[key] = value
+    if backup and os.path.exists(CONFIG):
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        shutil.copy2(CONFIG, CONFIG + ".bak." + stamp)
+        prune_backups()
+    atomic_write(CONFIG, json.dumps(current, indent=2) + "\n")
+
+
+def hour(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError("quiet hours must be whole hours from 0 to 23")
+    value = int(value)
+    if not 0 <= value <= 23:
+        raise ValueError("quiet hours must be whole hours from 0 to 23")
+    return value
+
+
+# sound.conf is read by hello-sound with the same rules (key=value, never sourced).
+def sound_read():
+    values = dict(SOUND_DEFAULTS)
+    try:
+        with open(SOUND_CONF, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        lines = []
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if "=" not in line:
+            continue
+        key, val = (part.strip().strip("\"'") for part in line.split("=", 1))
+        try:
+            if key == "VOLUME" and val:
+                values["volume"] = min(1.0, max(0.0, float(val)))
+            elif key in ("QUIET_START", "QUIET_END"):
+                values["quietStart" if key == "QUIET_START" else "quietEnd"] = hour(val)
+        except ValueError:
+            pass
+    return values
+
+
+def sound_save(raw):
+    update = json.loads(raw)
+    if not isinstance(update, dict):
+        sys.exit("hello-config: expected a JSON object")
+    values = sound_read()
+    if "volume" in update:
+        volume = update["volume"]
+        if isinstance(volume, bool) or not isinstance(volume, (int, float)):
+            raise ValueError("volume must be a number from 0 to 1")
+        values["volume"] = min(1.0, max(0.0, float(volume)))
+    for key in ("quietStart", "quietEnd"):
+        if key in update:
+            values[key] = hour(update[key])
+    if values["quietStart"] is None or values["quietEnd"] is None:
+        values["quietStart"] = values["quietEnd"] = None
+
+    def fmt(v):
+        return "" if v is None else str(v)
+    atomic_write(SOUND_CONF, "# Hello Lock sounds (written by the settings screen).\n"
+                 "VOLUME=%s\nQUIET_START=%s\nQUIET_END=%s\n"
+                 % (("%.2f" % values["volume"]).rstrip("0").rstrip(".") or "0",
+                    fmt(values["quietStart"]), fmt(values["quietEnd"])))
+
+
+def import_logo(path, announce=True):
+    src = os.path.realpath(os.path.expanduser(path))
+    ext = os.path.splitext(src)[1].lower()
+    if ext not in IMAGE_TYPES or not os.path.isfile(src):
+        sys.exit("hello-config: pick an SVG, PNG, JPG or WebP image")
+    if os.path.getsize(src) > 20 * 1024 * 1024:
+        sys.exit("hello-config: image is larger than 20 MB")
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(src, "rb") as f:
+        digest = hashlib.file_digest(f, "sha256").hexdigest()
+    dest = os.path.join(CONFIG_DIR, "logo-" + digest + ext)
+    if src != os.path.realpath(dest):
+        fd, tmp = tempfile.mkstemp(dir=CONFIG_DIR, prefix=".tmp-", suffix=ext)
+        os.close(fd)
+        try:
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, dest)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+    if announce:
+        print(dest)
+    return dest
+
+
+
+BRANDING_KEYS = ("brand", "logo", "symbol", "symbolParts", "tintLogo", "wordmarkText", "wordmarkStyle")
+
+
+
+def validate_presets(items):
+    if not isinstance(items, list):
+        raise ValueError("invalid branding preset collection: expected a list")
+    ids = set()
+    for p in items:
+        if (not isinstance(p, dict) or not isinstance(p.get("id"), str) or not p["id"].strip()
+                or p["id"] in ids or not isinstance(p.get("name"), str)
+                or not p["name"].strip() or len(p["name"]) > 60 or not isinstance(p.get("branding"), dict)):
+            raise ValueError("invalid branding preset entry: expected a unique ID, name and branding object")
+        ids.add(p["id"])
+        b = p["branding"]
+        if any(k in b and not isinstance(b[k], str) for k in ("brand", "logo", "symbol", "wordmarkText", "wordmarkStyle")):
+            raise ValueError("invalid branding preset: text and image paths must be strings")
+        if "tintLogo" in b and not isinstance(b["tintLogo"], bool):
+            raise ValueError("invalid branding preset: tintLogo must be boolean")
+        if "symbolParts" in b and (not isinstance(b["symbolParts"], list) or len(b["symbolParts"]) > 2
+                                  or any(not isinstance(v, str) or not v.strip() for v in b["symbolParts"])):
+            raise ValueError("invalid branding preset: expected up to two symbol paths")
+
+def presets(action, value):
+    try:
+        with open(CONFIG, encoding="utf-8") as f:
+            current = json.load(f)
+    except FileNotFoundError:
+        current = {}
+    if not isinstance(current, dict):
+        raise ValueError("existing config must be an object")
+    items = current.get("brandingPresets", [])
+    validate_presets(items)
+    update = {}
+    if action in ("create", "update"):
+        name = value.strip()
+        if not name or len(name) > 60:
+            raise ValueError("give the preset a name of 1–60 characters")
+        if action == "create" and any(p.get("name", "").casefold() == name.casefold() for p in items):
+            raise ValueError("that preset name already exists")
+        selected = current.get("selectedPreset")
+        if action == "update" and not any(p["id"] == selected for p in items):
+            raise ValueError("select a preset to update")
+        if action == "update" and any(p["id"] != selected and p.get("name", "").casefold() == name.casefold() for p in items):
+            raise ValueError("that preset name already exists")
+        branding = {k: current[k] for k in BRANDING_KEYS if k in current}
+        def preserve(path):
+            if not path or path.startswith("@"):
+                return path
+            path = os.path.expanduser(path)
+            if not os.path.isabs(path):
+                path = os.path.join(CONFIG_DIR, path)
+            return os.path.basename(import_logo(path, announce=False))
+        for key in ("logo", "symbol"):
+            if branding.get(key):
+                branding[key] = preserve(branding[key])
+        if branding.get("symbolParts"):
+            branding["symbolParts"] = [preserve(p) for p in branding["symbolParts"]]
+        import uuid
+        ident = selected if action == "update" else uuid.uuid4().hex
+        item = {"id": ident, "name": name, "branding": branding}
+        items = [item if p["id"] == ident else p for p in items] if action == "update" else items + [item]
+        update = {"brandingPresets": items, "selectedPreset": ident}
+    elif action in ("apply", "next"):
+        if not items:
+            raise ValueError("save a preset first")
+        if action == "next":
+            ids = [p["id"] for p in items]
+            previous = current.get("selectedPreset")
+            value = ids[(ids.index(previous) + 1) % len(ids)] if previous in ids else ids[0]
+        item = next((p for p in items if p["id"] == value), None)
+        if item is None:
+            raise ValueError("preset no longer exists")
+        update = {k: item["branding"].get(k) for k in BRANDING_KEYS}
+        update["selectedPreset"] = value
+    elif action == "delete":
+        if not any(p["id"] == value for p in items):
+            raise ValueError("preset no longer exists")
+        update = {"brandingPresets": [p for p in items if p["id"] != value]}
+        if current.get("selectedPreset") == value:
+            update["selectedPreset"] = None
+    elif action == "mode":
+        if value not in ("manual", "cycle", "shuffle"):
+            raise ValueError("unknown preset mode")
+        update = {"presetMode": value}
+    else:
+        raise ValueError("unknown preset action")
+    save(json.dumps(update))
+    with open(CONFIG, encoding="utf-8") as f:
+        print(f.read())
+
+def main(argv):
+    if len(argv) >= 2 and argv[1] == "doctor":
+        doctor = os.path.join(os.path.dirname(os.path.realpath(__file__)), "hello-lock-doctor")
+        os.execv(sys.executable, [sys.executable, "-I", doctor] + argv[2:])
+    if len(argv) == 4 and argv[1] == "preset":
+        presets(argv[2], argv[3])
+    elif len(argv) == 3 and argv[1] == "save":
+        save(argv[2])
+    elif len(argv) == 4 and argv[1] == "save" and argv[2] == "--no-backup":
+        save(argv[3], backup=False)
+    elif argv[1:] == ["sound-get"]:
+        print(json.dumps(sound_read()))
+    elif len(argv) == 3 and argv[1] == "sound-save":
+        sound_save(argv[2])
+    elif len(argv) == 3 and argv[1] == "import-logo":
+        import_logo(argv[2])
+    elif argv[1:] == ["done"]:
+        atomic_write(DONE, "1\n")
+    elif argv[1:] == ["pending"]:
+        sys.exit(1 if os.path.exists(DONE) else 0)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv)
+    except subprocess.CalledProcessError as exc:
+        sys.exit((exc.stderr or "hello-config: wordmark rendering failed").strip())
+    except (OSError, ValueError, TypeError) as exc:
+        sys.exit("hello-config: " + str(exc))

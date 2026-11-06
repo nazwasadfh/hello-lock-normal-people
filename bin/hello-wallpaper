@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# hello-wallpaper - resolve the lock-screen background image, one per line of
+# preference, and print the first existing one (never a dangling symlink).
+#
+# Order:
+#   1. ~/.config/hello-lock/wallpaper            (an image or a symlink to one)
+#   2. the Omarchy path (~/.local/state/omarchy/current/background) if present,
+#      so an Omarchy machine keeps its wallpaper
+#
+# A `wallpaper` path in config.json takes precedence and is resolved by
+# Service.qml itself; this script only covers the two on-disk candidates.
+# No output means: use the theme background colour, no image.
+exec 2>/dev/null
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hello-lock"
+OMARCHY_BG="$HOME/.local/state/omarchy/current/background"
+
+check() {
+  [[ -e $1 && ( -f $1 || -L $1 ) ]] || return 1
+  readlink -f -- "$1"
+}
+
+candidate=$(check "$CONF_DIR/wallpaper") && { printf '%s\n' "$candidate"; exit 0; }
+[[ -n $OMARCHY_BG ]] && candidate=$(check "$OMARCHY_BG") && { printf '%s\n' "$candidate"; exit 0; }
+exit 1

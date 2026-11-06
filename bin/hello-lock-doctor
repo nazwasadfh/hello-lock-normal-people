@@ -1,0 +1,552 @@
+#!/usr/bin/env -S python3 -I
+"""hello-lock-doctor - check a standalone (Omarchy-free) Hello Lock install.
+
+Usage: hello-lock-doctor [--json] [--config PATH] [--online]
+
+Checks, read-only:
+  - the plugin folder (fonts, sounds, symbols, typing effects, scripts)
+  - the PAM service files (/etc/pam.d/hello-lock-password, -fingerprint)
+  - the shell: quickshell installed; lock service answering `qs ipc call lock status`
+  - dependencies: hyprctl, python3, grim, curl, pw-play/paplay, zenity (warn only)
+  - your ~/.config/hello-lock/config.json: unknown keys, wrong types, birthday
+    format, logo/symbol files, symbol names, typing effect, handoff, motion, wallpaper
+  - sound settings in sound.conf
+  - leftover lock-screen snapshots in $XDG_RUNTIME_DIR
+
+Every problem comes with how to fix it. Exits 0 when all is good, 1 on
+warnings and 2 on problems. --online also tests reaching wttr.in.
+"""
+
+import difflib
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "hello-lock")
+CONFIG = os.path.join(CONFIG_DIR, "config.json")
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or os.path.join("/run/user", str(os.getuid()))
+PAM_PASSWORD = "/etc/pam.d/hello-lock-password"
+PAM_FINGERPRINT = "/etc/pam.d/hello-lock-fingerprint"
+
+HANDOFF_NAMES = ["fallback", "liftoff", "slide", "flip", "dissolve", "split", "blinds",
+                 "scatter", "wipe", "glitch", "poweroff", "flythrough", "fold", "drop",
+                 "pixelate", "shuffle"]
+MOTION_VALUES = ["auto", "full", "reduced"]
+WORDMARK_MAX = 12
+
+WARNINGS = []
+PROBLEMS = []
+
+
+def tilde(path):
+    home = HOME + "/"
+    return str(path).replace(home, "~/") if path else str(path)
+
+
+def run(cmd, timeout=4, env=None):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL, env=env)
+        return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+    except Exception:
+        return 127, "", "missing"
+
+
+def ipc(*args):
+    """Answer from the running lock service, or (rc, stderr)."""
+    return run(["qs", "ipc", "-p", PLUGIN_DIR, "call", "lock", *args], timeout=6)
+
+
+def suggest(word, options):
+    if not word:
+        return ""
+    m = difflib.get_close_matches(word, list(options), n=1, cutoff=0.6)
+    return m[0] if m else ""
+
+
+def say(kind, title, detail="", fix=""):
+    line = "  %s%s" % (title, (" - " + detail) if detail else "")
+    print(line)
+    if fix:
+        print("      fix: " + fix)
+    if kind == 2:
+        PROBLEMS.append(title)
+    elif kind == 1:
+        WARNINGS.append(title)
+
+
+OK, WARN, ERROR, INFO = 0, 1, 2, 99
+
+
+def section(title):
+    print("\n" + title)
+
+
+# ------------------------------------------------------------ deep lookups
+def split_top_level(body):
+    parts, depth, cur, quote = [], 0, "", ""
+    for ch in body:
+        if quote:
+            cur += ch
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in "\"'":
+            quote = ch
+        elif ch in "[{(":
+            depth += 1
+        elif ch in "]})":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+            continue
+        cur += ch
+    if cur.strip():
+        parts.append(cur)
+    return parts
+
+
+def config_schema():
+    """Config keys and types, read live from Service.qml (configDefaults) and
+    bin/hello-config (ALLOWED), so the doctor never drifts from the code."""
+    schema, notes = {}, []
+    try:
+        src = open(os.path.join(PLUGIN_DIR, "Service.qml"), encoding="utf-8").read()
+        m = re.search(r"configDefaults\s*:\s*\(\{(.*?)\}\)", src, re.S)
+        for part in split_top_level(m.group(1)) if m else []:
+            k, _, v = part.partition(":")
+            k, v = k.strip(), v.strip()
+            if not re.fullmatch(r"[A-Za-z_]\w*", k):
+                continue
+            if v in ("true", "false"):
+                schema[k] = bool
+            elif v.startswith("["):
+                schema[k] = list
+            elif v[:1] in "\"'":
+                schema[k] = str
+            else:
+                schema[k] = None
+        if schema:
+            notes.append("Service.qml")
+    except OSError:
+        pass
+    try:
+        src = open(os.path.join(PLUGIN_DIR, "bin", "hello-config"), encoding="utf-8").read()
+        m = re.search(r"^ALLOWED\s*=\s*(\{.*?\})", src, re.S | re.M)
+        if m:
+            for k in re.findall(r"['\"]([A-Za-z_]\w*)['\"]", m.group(1)):
+                schema.setdefault(k, str)
+            notes.append("hello-config")
+    except OSError:
+        pass
+    if not schema:
+        schema = {k: str for k in ("name", "brand", "logo", "symbol", "birthday", "motion",
+                                   "wallpaper", "wordmarkText", "wordmarkStyle", "typingEffect")}
+        schema.update({k: bool for k in ("tintLogo", "sounds", "weather", "powerDown",
+                                         "legendary", "clock")})
+        schema["symbolParts"] = list
+        notes.append("built-in list")
+    return schema, " + ".join(notes)
+
+
+def wordmark_styles():
+    rc, out, _ = run([sys.executable, "-I", os.path.join(PLUGIN_DIR, "bin", "hello-wordmark"), "--styles"])
+    styles = [s.strip() for s in out.splitlines() if s.strip()] if rc == 0 else []
+    return styles or ["omarchy", "blocks", "outline", "scanline", "led", "tiles", "split",
+                      "italic", "wide", "glitch", "shadow"]
+
+
+def typing_effects():
+    return sorted(os.path.splitext(os.path.basename(p))[0]
+                  for p in glob.glob(os.path.join(PLUGIN_DIR, "typing", "*.qml")))
+
+
+def builtin_symbols():
+    return sorted(os.path.splitext(os.path.basename(p))[0]
+                  for p in glob.glob(os.path.join(PLUGIN_DIR, "symbols", "*.svg")))
+
+
+def resolve_path(value, config_dir):
+    v = str(value).strip()
+    if not v or not (v[0] == "/" or v[0] == "~" or re.fullmatch(r"@[a-z0-9-]+", v)):
+        return os.path.join(config_dir, v) if v else ""
+    if v == "~":
+        return HOME
+    if v.startswith("~/"):
+        return os.path.join(HOME, v[2:])
+    if re.fullmatch(r"@[a-z0-9-]+", v):
+        return os.path.join(PLUGIN_DIR, "symbols", v[1:] + ".svg")
+    return v
+
+
+type_names = {bool: "true or false", str: "text", list: "a list [ ... ]",
+              int: "a number", float: "a number"}
+json_names = {bool: "boolean", str: "string", list: "array", int: "number"}
+
+
+# ------------------------------------------------------------ checks
+def check_plugin():
+    S = "Plugin"
+    section("Plugin files")
+    if os.path.isdir(PLUGIN_DIR) and os.access(PLUGIN_DIR, os.R_OK):
+        say(OK, "Installed at " + tilde(PLUGIN_DIR))
+    else:
+        say(ERROR, "Plugin folder %s missing or unreadable" % PLUGIN_DIR, "",
+            "re-run install.sh where you cloned hello-lock")
+
+    news = []
+    for rel in ("fonts/Oxanium-Variable.ttf", "fonts/ShareTechMono-Regular.ttf"):
+        if not os.path.isfile(os.path.join(PLUGIN_DIR, rel)):
+            news.append(rel)
+    if news:
+        say(ERROR, "Bundled fonts missing: " + ", ".join(news), "", "reinstall the folder")
+    else:
+        say(OK, "Fonts present (Oxanium, Share Tech Mono)")
+
+    n_sounds = len(glob.glob(os.path.join(PLUGIN_DIR, "sounds", "*.wav")))
+    if n_sounds and os.path.isfile(os.path.join(PLUGIN_DIR, "sounds", "lock.wav")):
+        say(OK, "Sound pack present (%d wav files)" % n_sounds)
+    else:
+        say(WARN, "sounds/ is missing or has no lock.wav",
+            "Lock/unlock/type cues are silent.", "reinstall the folder")
+
+    n_symbols = len(builtin_symbols())
+    if n_symbols:
+        say(OK, "%d built-in unlock symbols" % n_symbols)
+    else:
+        say(WARN, "symbols/ has no SVGs; built-in unlock symbols and @shuffle are empty",
+            "Bring your own logo, or reinstall.")
+
+    effects = typing_effects()
+    if "cells" in effects:
+        say(OK, "%d typing effects installed" % len(effects))
+    else:
+        say(WARN, "typing/cells.qml missing; the default typing effect falls back to a plain logo",
+            "", "reinstall the folder")
+
+    for name in ("hello-snapshot", "hello-sound", "hello-status", "hello-wordmark", "helloctl"):
+        path = os.path.join(PLUGIN_DIR, "bin", name)
+        if not os.path.isfile(path):
+            say(ERROR, "bin/%s is missing" % name, "", "reinstall the folder")
+        elif not os.access(path, os.X_OK):
+            say(ERROR, "bin/%s is not executable" % name, "", "chmod +x " + tilde(path))
+
+
+def check_pam_and_shell():
+    section("Authentication and the shell")
+    if os.path.isfile(PAM_PASSWORD) and os.access(PAM_PASSWORD, os.R_OK):
+        say(OK, "PAM service present: " + tilde(PAM_PASSWORD))
+    else:
+        say(ERROR, "PAM service %s is missing" % PAM_PASSWORD,
+            "The lock screen refuses to lock without the PAM file.",
+            "sudo install -m 644 " + tilde(os.path.join(PLUGIN_DIR, "pam", "hello-lock-password")) + " " + PAM_PASSWORD)
+
+    fp = os.path.isfile(PAM_FINGERPRINT)
+    have_reader = shutil.which("fprintd-list") is not None
+    if fp:
+        if have_reader:
+            say(OK, "Fingerprint PAM service present and a reader is on the machine")
+        else:
+            say(INFO, "Fingerprint PAM service present but no reader detected",
+                "Password unlock works either way. Install fprintd and enrol to use it.")
+    else:
+        say(INFO, "No fingerprint PAM service (%s)" % PAM_FINGERPRINT,
+            "That's fine on machines without a reader. To add one:",
+            "sudo install -m 644 " + tilde(os.path.join(PLUGIN_DIR, "pam", "hello-lock-fingerprint")) + " " + PAM_FINGERPRINT)
+
+    if shutil.which("qs") is None:
+        say(ERROR, "quickshell (`qs`) is not in PATH", "Nothing runs without it.",
+            "install quickshell (extra/quickshell-git or quickshell, from AUR)")
+    else:
+        rc, out, err = ipc("status")
+        if rc == 0 and out.startswith("{"):
+            try:
+                st = json.loads(out)
+                say(OK, "Lock service is running (last event: %s)" % st.get("lastEvent"))
+                if not st.get("passwordPam"):
+                    say(ERROR, "The running lock service doesn't see the PAM file",
+                        "It refuses to lock, currently and after the next lock.",
+                        "fix the PAM installation below, then `qs ipc -p %s call lock status` again" % PLUGIN_DIR)
+            except ValueError:
+                say(WARN, "The lock IPC answered with something unreadable", out[:120], "hello-lock-doctor again after a lock")
+        else:
+            why = (err or "no answer").replace("qs ipc: ", "")
+            say(WARN, "The lock service didn't answer on IPC (%s)" % why,
+                "If the shell isn't running, nothing locks.", "start: qs -p " + PLUGIN_DIR)
+
+    if shutil.which("hyprctl") is None:
+        say(WARN, "hyprctl not found",
+            "Display wake/blank and the reduced-motion check use it; on Wayland sessions "
+            "without Hyprland they do nothing.", "this port targets Hyprland; other compositors are untested")
+
+
+def check_deps():
+    section("Dependencies")
+    needed = {"python3": "the status line and helper scripts",
+              "grim": "the power-down snapshot when you lock",
+              "curl": "weather (only needed with weather on)"}
+    warned = []
+    for cmd, why in needed.items():
+        if shutil.which(cmd):
+            continue
+        if cmd == "curl":
+            # Does the weather need to be enabled?
+            try:
+                with open(CONFIG, encoding="utf-8") as f:
+                    if json.load(f).get("weather") is False:
+                        continue
+            except Exception:
+                pass
+        warned.append(cmd)
+        say(WARN, "%s missing (%s)" % (cmd, why), "", "install the package that provides " + cmd)
+    sound_player = shutil.which("pw-play") or shutil.which("paplay")
+    if sound_player:
+        say(OK, "Sound playback via " + sound_player)
+    else:
+        warned.append("pw-play")
+        say(WARN, "Neither pw-play (pipewire) nor paplay (pulseaudio) found",
+            "All sound cues stay silent.", "install pipewire-audio")
+    if shutil.which("zenity"):
+        say(OK, "Zenity present (setup logo chooser)")
+    else:
+        say(INFO, "No zenity/kdialog; the setup's logo picker can't open a window",
+            "Set \"logo\" in config.json by hand instead.",
+            "install zenity (extra/zenity)")
+    if not warned:
+        say(OK, "All needed helper programs present")
+
+
+def check_config_and_sound():
+    section("Settings")
+    schema, schema_src = config_schema()
+    if not os.path.exists(CONFIG):
+        say(OK, "No config.json; using defaults (your account's name, the default logo)")
+        return
+    try:
+        raw = open(CONFIG, encoding="utf-8").read()
+    except OSError as e:
+        say(ERROR, tilde(CONFIG) + " can't be read", str(e), "chmod 644 " + tilde(CONFIG))
+        return
+    if not raw.strip():
+        say(OK, "config.json is empty; using defaults")
+        return
+    try:
+        cfg = json.loads(raw)
+    except ValueError as e:
+        say(ERROR, "config.json is not valid JSON", str(e) + " The whole file is ignored until fixed.",
+            "python3 -m json.tool " + tilde(CONFIG))
+        return
+    if not isinstance(cfg, dict):
+        say(ERROR, "config.json must be a JSON object ({ ... })", "It's ignored.",
+            "wrap the settings in { }")
+        return
+    say(OK, "config.json parses (%d setting%s, schema from %s)" %
+        (len(cfg), "" if len(cfg) == 1 else "s", schema_src))
+
+    for key in cfg:
+        if key not in schema:
+            hint = suggest(key, schema) or suggest(key.lower(), {k.lower(): k for k in schema})
+            say(WARN, 'Unknown key "%s"' % key,
+                ('Did you mean "%s"? It\'s ignored.' % hint) if hint else
+                "Ignored. Known keys: " + ", ".join(sorted(schema)) + ".",
+                'rename or remove "%s"' % key)
+
+    wrong = False
+    for key, t in schema.items():
+        if key not in cfg or t is None:
+            continue
+        v = cfg[key]
+        bad = not (isinstance(v, bool) if t is bool else isinstance(v, t) and not isinstance(v, bool))
+        if bad:
+            wrong = True
+            say(ERROR, '"%s" should be %s, not %r' % (key, type_names.get(t, type(t).__name__), v),
+                "The default is used instead.",
+                'set "%s" to a %s' % (key, json_names.get(t, t).__name__ if t != list else "array"))
+            cfg[key] = None
+    if not wrong:
+        say(OK, "All key types check out")
+
+    import datetime
+    b = cfg.get("birthday")
+    if isinstance(b, str) and b.strip():
+        m = re.fullmatch(r"(\d{2})-(\d{2})", b.strip())
+        valid = False
+        if m:
+            try:
+                datetime.date(2024, int(m.group(1)), int(m.group(2)))
+                valid = True
+            except ValueError:
+                pass
+        if valid:
+            say(OK, 'birthday "%s" is valid' % b.strip())
+        else:
+            say(ERROR, 'birthday "%s" isn\'t a valid "MM-DD" date' % b, "No greeting until it's fixed.",
+                'e.g. "birthday": "12-10"')
+
+    symbols = set(builtin_symbols())
+    for key in ("logo", "wallpaper"):
+        v = cfg.get(key)
+        if isinstance(v, str) and v.strip():
+            path = resolve_path(v, CONFIG_DIR)
+            if os.path.isfile(path):
+                say(OK, '%s: %s exists' % (key, v))
+            else:
+                say(ERROR, '%s "%s" is not a file' % (key, v), "The default is used instead.",
+                    "fix the path in config.json")
+    sym = cfg.get("symbol")
+    if isinstance(sym, str) and sym.strip():
+        if re.fullmatch(r"@[a-z0-9-]+", sym.strip()) == None and sym.strip() != "@shuffle":
+            path = resolve_path(sym, CONFIG_DIR)
+            if not os.path.isfile(path):
+                say(ERROR, 'symbol "%s" is not a file' % sym, "The logo is used on unlock instead.",
+                    'a built-in looks like "@radar", "@shuffle", or a path')
+        elif isinstance(sym, str) and re.fullmatch(r"@([a-z0-9-]+)", sym.strip()):
+            name = sym.strip()[1:]
+            if name != "shuffle" and name not in symbols:
+                say(ERROR, 'symbol "%s" doesn\'t name a built-in' % sym,
+                    "Falls back to your logo.", "choose from: " + ", ".join(sorted(symbols)))
+    parts = cfg.get("symbolParts")
+    if isinstance(parts, list) and parts:
+        for i, p in enumerate(parts[:2]):
+            if isinstance(p, str):
+                path = resolve_path(p, CONFIG_DIR)
+                if not os.path.isfile(path):
+                    say(ERROR, "symbolParts[%d] is not a file" % i, "", "fix the path")
+        if len(parts) > 2:
+            say(WARN, "symbolParts has %d entries; only the first two are used" % len(parts),
+                "They are the outer and inner part.", "remove the extras")
+
+    effects = set(typing_effects()) | {"shuffle", "off"}
+    eff = cfg.get("typingEffect")
+    if isinstance(eff, str) and eff.strip():
+        if eff.strip() not in effects:
+            hint = suggest(eff.strip().lower(), effects)
+            say(ERROR, 'typingEffect "%s" isn\'t one of the installed effects' % eff,
+                ('Did you mean "%s"? ' % hint if hint else "") + "Falls back to cells.",
+                "installed: " + ", ".join(sorted(effects)))
+        elif eff.strip() not in typing_effects() and eff.strip() not in ("shuffle", "off"):
+            say(WARN, 'typingEffect "%s" has no file in typing/' % eff, "The logo stays plain while you type.",
+                "reinstall the folder")
+    hand = cfg.get("handoff")
+    if isinstance(hand, str) and hand.strip() and hand.strip().lower() not in HANDOFF_NAMES:
+        hint = suggest(hand.strip().lower(), HANDOFF_NAMES)
+        say(ERROR, 'handoff "%s" isn\'t a transition name' % hand,
+            "Falls back to shuffle.", "one of: " + ", ".join(HANDOFF_NAMES))
+    motion = cfg.get("motion")
+    if isinstance(motion, str) and motion.strip() and motion.strip() not in MOTION_VALUES:
+        hint = suggest(motion.strip().lower(), MOTION_VALUES)
+        say(ERROR, 'motion "%s" isn\'t one of "auto", "full", "reduced"' % motion,
+            "It behaves like auto.", 'set "motion": "auto"')
+
+    # sound.conf
+    sconf = os.path.join(CONFIG_DIR, "sound.conf")
+    if os.path.isfile(sconf):
+        try:
+            src = open(sconf, encoding="utf-8").read()
+            keys = {}
+            order = []
+            for line in src.splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    key = k.strip()
+                    if key not in ("VOLUME", "QUIET_START", "QUIET_END", "OFF"):
+                        say(WARN, "sound.conf: unknown key %s ignored" % key, "", "allowed: VOLUME, QUIET_START, QUIET_END")
+                    else:
+                        keys[key] = v.strip()
+                        order.append(key)
+            vol = keys.get("VOLUME", "").strip()
+            if vol:
+                try:
+                    value = float(vol)
+                except ValueError:
+                    say(WARN, "sound.conf: VOLUME isn't a number", "", "e.g. VOLUME=0.5")
+                else:
+                    if not (0.0 <= value <= 1.0):
+                        say(WARN, "sound.conf: VOLUME %s is outside 0.0-1.0" % vol, "", "VOLUME=0.5")
+            else:
+                keys.pop("VOLUME", None)
+            if not PROBLEMS:
+                say(OK, "sound.conf: " + (", ".join("%s" % k for k in order) or "parses"))
+        except OSError:
+            pass
+    if os.path.isfile(os.path.join(CONFIG_DIR, "sounds-off")):
+        say(INFO, "A 'sounds-off' marker exists: ALL sounds are muted (delete the file to restore)")
+
+
+def check_leftovers():
+    section("Leftovers")
+    try:
+        dirs = glob.glob(os.path.join(RUNTIME_DIR, "hello-lock-snapshot-*"))
+        dirs = [d for d in dirs if os.path.isdir(d)]
+    except OSError:
+        dirs = []
+    if dirs:
+        try:
+            import time as _t
+            newest = max(_t.time() - os.path.getmtime(d) for d in dirs if os.path.isdir(d))
+        except OSError:
+            newest = None
+        if newest is None or newest > 60:
+            say(WARN, "%d leftover snapshot folder(s) in %s" % (len(dirs), tilde(RUNTIME_DIR)),
+                "They contain a desktop screenshot at lock time, mode 700.",
+                "rm -rf " + " ".join(tilde(d) for d in dirs))
+        else:
+            say(OK, "%d recent snapshot folder(s); the cleanup timer owns them" % len(dirs))
+    else:
+        say(OK, "No leftover lock-screen snapshots")
+
+
+def check_online():
+    section("Online (only with --online)")
+    _, out, err = run(["curl", "-fsS", "--max-time", "6", "https://wttr.in/?format=%t"], timeout=8)
+    if out.strip() and "°" in out:
+        say(OK, "wttr.in reachable (%s)" % out.strip())
+    else:
+        say(WARN, "wttr.in unreachable (%s)" % (err or "no answer"),
+            "The weather line will be empty; everything else works.",
+            'check your network, or set "weather": false')
+    return
+
+
+def main(argv):
+    if not os.path.isdir(PLUGIN_DIR):
+        print("hello-lock-doctor: no plugin folder at " + PLUGIN_DIR, file=sys.stderr)
+        return 2
+    if getattr(os, "getuid", lambda: -1)() == 0:
+        print("hello-lock-doctor: refusing to run as root (checks your session, not root's)",
+              file=sys.stderr)
+        return 2
+    check_plugin()
+    check_pam_and_shell()
+    check_deps()
+    check_config_and_sound()
+    check_leftovers()
+    if "--online" in argv:
+        check_online()
+    print("\n---")
+    if PROBLEMS:
+        print("%d problem%s. Fix them and run me again." % (len(PROBLEMS), "" if len(PROBLEMS) == 1 else "s"))
+        return 2
+    if WARNINGS:
+        print("%d warning%s; everything else is good." % (len(WARNINGS), "" if len(WARNINGS) == 1 else "s"))
+        return 1
+    print("All good.")
+    return 0
+
+
+if __name__ == "__main__":
+    if "--json" in sys.argv[1:]:
+        print(json.dumps({"warnings": sorted(set(WARNINGS)), "problems": sorted(set(PROBLEMS))}))
+        sys.exit(len(PROBLEMS) and 2 or (len(WARNINGS) and 1 or 0))
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)
